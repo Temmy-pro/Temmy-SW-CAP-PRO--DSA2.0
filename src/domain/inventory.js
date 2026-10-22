@@ -36,6 +36,20 @@ function requirePositiveInteger(value, label) {
   }
 }
 
+function isValidIsoDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})?)?$/.test(value)) {
+    return false;
+  }
+
+  const [year, month, day] = value.slice(0, 10).split('-').map(Number);
+  const calendarDate = new Date(Date.UTC(year, month - 1, day));
+
+  return calendarDate.getUTCFullYear() === year
+    && calendarDate.getUTCMonth() === month - 1
+    && calendarDate.getUTCDate() === day
+    && Number.isFinite(Date.parse(value));
+}
+
 function getEvent(store, eventId) {
   const event = store.events.get(eventId);
 
@@ -75,11 +89,11 @@ export function createEvent(store, eventInput) {
   const venue = requireText(eventInput.venue, 'Event venue');
   const date = requireText(eventInput.date, 'Event date');
 
-  if (!Number.isFinite(Date.parse(date))) {
-    throw new DomainError('Event date must be a valid date.', 'VALIDATION');
+  if (!isValidIsoDate(date)) {
+    throw new DomainError('Event date must be a valid ISO date.', 'VALIDATION');
   }
 
-  const event = { id: newId(), title, city, venue, date };
+  const event = { id: newId(), title, city, venue, date, status: 'DRAFT' };
   store.events.set(event.id, event);
   return event;
 }
@@ -104,6 +118,7 @@ export function addTier(store, eventId, tierInput) {
     name,
     priceCents: tierInput.priceCents,
     capacity: tierInput.capacity,
+    sold: 0,
     available: tierInput.capacity,
   };
 
@@ -154,10 +169,11 @@ export function bookTickets(store, bookingInput) {
     attendeeName,
     quantity,
     totalCents,
-    status: 'ACTIVE',
+    status: 'PENDING',
   };
 
   tier.available -= quantity;
+  tier.sold += quantity;
   store.bookings.set(booking.id, booking);
   store.bookingsByReference.set(booking.reference, booking);
   return booking;
@@ -172,7 +188,7 @@ export function cancelBooking(store, referenceInput) {
     throw new DomainError('Booking was not found.', 'NOT_FOUND');
   }
 
-  if (booking.status !== 'ACTIVE') {
+  if (booking.status !== 'PENDING') {
     throw new DomainError('Booking has already been cancelled.', 'INVALID_STATE');
   }
 
@@ -183,6 +199,7 @@ export function cancelBooking(store, referenceInput) {
   }
 
   tier.available += booking.quantity;
+  tier.sold -= booking.quantity;
   booking.status = 'CANCELLED';
   return booking;
 }
@@ -220,4 +237,44 @@ export function joinWaitlist(store, waitlistInput) {
   const entry = { attendeeName, tierId: tier.id };
   queue.enqueue(entry);
   return entry;
+}
+
+export function publishEvent(store, eventId) {
+  assertStore(store);
+  requireText(eventId, 'Event id');
+  const event = getEvent(store, eventId);
+  const hasTiers = Array.from(store.tiers.values()).some((tier) => tier.eventId === event.id);
+
+  if (!hasTiers) {
+    throw new DomainError('An event must have at least one ticket tier before publishing.', 'INVALID_STATE');
+  }
+
+  event.status = 'PUBLISHED';
+  return event;
+}
+
+export function listEventSummaries(store, options = {}) {
+  assertStore(store);
+  assertRecord(options, 'List options');
+  const { publishedOnly = true } = options;
+
+  if (typeof publishedOnly !== 'boolean') {
+    throw new DomainError('publishedOnly must be a boolean.', 'VALIDATION');
+  }
+
+  const summaries = [];
+
+  for (const event of store.events.values()) {
+    if (publishedOnly && event.status !== 'PUBLISHED') {
+      continue;
+    }
+
+    const tiers = Array.from(store.tiers.values())
+      .filter((tier) => tier.eventId === event.id)
+      .map((tier) => ({ ...tier }));
+
+    summaries.push({ ...event, tiers });
+  }
+
+  return summaries;
 }
