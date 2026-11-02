@@ -4,6 +4,10 @@ import { createServer } from 'node:http';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DomainError } from '../domain/errors.js';
+import { createMemoryRepository } from '../repositories/memory.js';
+import { addTier, createEvent, publishEvent, searchPublishedEvents } from '../services/eventService.js';
+import { cancelUnpaidBooking, createBooking, payForBooking } from '../services/bookingService.js';
+import { mockPaymentGateway } from '../lib/mockPaymentGateway.js';
 import { createRouter } from './router.js';
 
 const DEFAULT_PUBLIC_DIR = fileURLToPath(new URL('../../public/', import.meta.url));
@@ -34,6 +38,8 @@ function errorStatus(error) {
   if (error.code === 'NOT_FOUND') return 404;
   if (error.code === 'PAYLOAD_TOO_LARGE') return 413;
   if (error.code === 'METHOD_NOT_ALLOWED') return 405;
+  if (error.code === 'FORBIDDEN') return 403;
+  if (error.code === 'PAYMENT_DECLINED') return 402;
   if (error instanceof DomainError) return 400;
   return 500;
 }
@@ -147,7 +153,85 @@ async function serveStatic(request, response, pathname, publicDir) {
   });
 }
 
-export function createApp({ router = createRouter(), publicDir = DEFAULT_PUBLIC_DIR } = {}) {
+function requireJsonObject(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new DomainError('Request body must be a JSON object.', 'VALIDATION');
+  }
+  return body;
+}
+
+function requireQueryInteger(value, label) {
+  if (!/^\d+$/.test(value)) {
+    throw new DomainError(`${label} must be a non-negative whole number of cents.`, 'VALIDATION');
+  }
+
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw new DomainError(`${label} must be a non-negative whole number of cents.`, 'VALIDATION');
+  }
+  return number;
+}
+
+function requireQueryBoolean(value, label) {
+  if (value !== 'true' && value !== 'false') {
+    throw new DomainError(`${label} must be true or false.`, 'VALIDATION');
+  }
+  return value === 'true';
+}
+
+function registerApiRoutes(router, repository, paymentGateway) {
+  router.add('POST', '/api/events', async ({ request, body }) => ({
+    status: 201,
+    body: await createEvent(repository, request.headers['x-user-id'], requireJsonObject(body)),
+  }));
+  router.add('POST', '/api/events/:id/tiers', async ({ request, params, body }) => ({
+    status: 201,
+    body: await addTier(repository, params.id, request.headers['x-user-id'], requireJsonObject(body)),
+  }));
+  router.add('POST', '/api/events/:id/publish', async ({ request, params }) => ({
+    body: await publishEvent(repository, params.id, request.headers['x-user-id']),
+  }));
+  router.add('GET', '/api/events', async ({ url }) => {
+    const criteria = {};
+    for (const key of ['q', 'city', 'from', 'to']) {
+      if (url.searchParams.has(key)) criteria[key] = url.searchParams.get(key);
+    }
+    if (url.searchParams.has('maxPriceCents')) {
+      criteria.maxPriceCents = requireQueryInteger(url.searchParams.get('maxPriceCents'), 'Maximum price');
+    }
+    if (url.searchParams.has('onlyAvailable')) {
+      criteria.onlyAvailable = requireQueryBoolean(url.searchParams.get('onlyAvailable'), 'onlyAvailable');
+    }
+
+    return {
+      body: await searchPublishedEvents(repository, criteria, url.searchParams.get('sortBy') ?? 'date'),
+    };
+  });
+  router.add('POST', '/api/bookings', async ({ request, body }) => ({
+    status: 201,
+    body: await createBooking(repository, request.headers['x-user-id'], requireJsonObject(body)),
+  }));
+  router.add('POST', '/api/bookings/:reference/pay', async ({ request, params, body }) => ({
+    body: await payForBooking(
+      repository,
+      paymentGateway,
+      params.reference,
+      request.headers['x-user-id'],
+      body === undefined ? {} : requireJsonObject(body),
+    ),
+  }));
+  router.add('POST', '/api/bookings/:reference/cancel', async ({ request, params }) => ({
+    body: await cancelUnpaidBooking(repository, params.reference, request.headers['x-user-id']),
+  }));
+}
+
+export function createApp({
+  router = createRouter(),
+  publicDir = DEFAULT_PUBLIC_DIR,
+  repository = createMemoryRepository(),
+  paymentGateway = mockPaymentGateway,
+} = {}) {
+  registerApiRoutes(router, repository, paymentGateway);
   const root = resolve(publicDir);
 
   return async function handleRequest(request, response) {
